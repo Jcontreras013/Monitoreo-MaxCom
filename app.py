@@ -2,221 +2,243 @@ import streamlit as st
 import pandas as pd
 import os
 import plotly.express as px
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
-# IMPORTACIÓN DE TUS HERRAMIENTAS
-from tools import COLUMNS_MAPPING, es_offline_preciso, procesar_dataframe_base
 
-# --- 1. CONFIGURACIÓN DE PÁGINA (RESPONSIVE) ---
-st.set_page_config(
-    layout="wide", # Clave para que use todo el ancho de la pantalla
-    page_title="Monitor Operativo Maxcom",
-    page_icon="⚡"
-)
+try:
+    from tools import *
+except ImportError:
+    st.error("⚠️ No se encontró 'tools.py'.")
 
-# --- VENTANA EMERGENTE ---
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(layout="wide", page_title="Monitor Operativo Maxcom PRO", page_icon="⚡")
+
+# --- DIÁLOGO DE DETALLES ---
 @st.dialog("Detalle de Gestión")
 def mostrar_comentario_cierre(fila):
-    st.markdown(f"### Orden: {fila['NUM']}")
-    st.write(f"**Cliente:** {fila['CLIENTE']}")
-    st.write(f"**Estado:** {fila['ESTADO']}")
+    st.markdown(f"### 📋 Orden: {fila['NUM']}")
+    st.write(f"**Cliente:** {fila['CLIENTE']} | **Estado:** {fila['ESTADO']}")
+    st.write(f"**Técnico:** {fila['TECNICO']} ({fila.get('MX', 'S/N')})")
     st.divider()
-    st.markdown("**Comentario de Cierre:**")
-    st.info(fila['COMENTARIO'] if pd.notnull(fila['COMENTARIO']) else "Sin comentarios.")
+    st.info(fila['COMENTARIO'] if pd.notnull(fila['COMENTARIO']) else "Sin comentarios registrados.")
+    if st.button("Cerrar"): st.rerun()
 
-# --- 2. LÓGICA DE CARGA (CORREGIDA PARA VER TODAS LAS ÓRDENES) ---
-@st.cache_data(ttl=60) # Cache de 1 minuto para que se actualice solo
-def cargar_y_limpiar(file_path):
-    if not os.path.exists(file_path): return None
+# --- CARGA Y LIMPIEZA ---
+@st.cache_data(show_spinner="Actualizando base de datos...")
+def cargar_y_limpiar(path):
+    if not os.path.exists(path): return None
     try:
-        xls = pd.ExcelFile(file_path)
+        xls = pd.ExcelFile(path)
         df = pd.read_excel(xls, sheet_name='Prueba', dtype={'NUM': str})
         df = procesar_dataframe_base(df)
-
-        # Mapeo de Vehículos (MX)
+        
         if 'utilerias' in xls.sheet_names:
-            df_util = pd.read_excel(xls, sheet_name='utilerias')
-            df_util.columns = df_util.columns.str.strip()
-            if 'TECNICO' in df_util.columns and ('MX' in df_util.columns or 'VEHICULO' in df_util.columns):
-                col_v = 'MX' if 'MX' in df_util.columns else 'VEHICULO'
-                mapeo_v = df_util[['TECNICO', col_v]].dropna().drop_duplicates('TECNICO')
-                df = df.merge(mapeo_v, on='TECNICO', how='left')
-                df = df.rename(columns={col_v: 'MX_final'})
-                if 'MX' in df.columns: df['MX'] = df['MX_final'].combine_first(df['MX'])
-                else: df['MX'] = df['MX_final']
+            df_u = pd.read_excel(xls, sheet_name='utilerias')
+            df_u.columns = df_u.columns.str.strip()
+            if 'TECNICO' in df_u.columns:
+                col_mx = next((c for c in ['MX','VEHICULO','UNIDAD'] if c in df_u.columns), None)
+                if col_mx:
+                    m = df_u[['TECNICO', col_mx]].dropna().drop_duplicates('TECNICO')
+                    df = df.merge(m, on='TECNICO', how='left').rename(columns={col_mx: 'MX_final'})
+                    df['MX'] = df['MX_final'].combine_first(df.get('MX', pd.Series(dtype=str)))
 
-        for col in ['HORA_INI', 'HORA_LIQ', 'FECHA_APE']:
-            if col in df.columns: df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
+        for c in ['HORA_INI', 'HORA_LIQ', 'FECHA_APE']:
+            if c in df.columns: df[c] = pd.to_datetime(df[c], dayfirst=True, errors='coerce')
 
-        # --- CORRECCIÓN DE FILTRO DE FECHAS ---
         hoy_dt = pd.Timestamp(datetime.now())
-        hoy_norm = hoy_dt.normalize()
-        
-        # Mantenemos: 
-        # 1. Todo lo que no tenga HORA_LIQ (está en proceso, sin importar la fecha de apertura)
-        # 2. Lo que se cerró hoy
-        # 3. Lo que se abrió hoy
-        condicion = (df['HORA_LIQ'].isna()) | \
-                    (df['HORA_LIQ'].dt.normalize() == hoy_norm) | \
-                    (df['FECHA_APE'].dt.normalize() == hoy_norm)
-        
-        df = df[condicion].copy()
+        limite = hoy_dt - timedelta(days=7) 
+        df = df[(df['HORA_LIQ'] >= limite) | (df['FECHA_APE'] >= limite) | (df['HORA_LIQ'].isna())].copy()
 
-        # Lógica Offline
-        df['ES_OFFLINE'] = df.apply(es_offline_preciso, axis=1)
-        
-        def validar_si_es_critico(row):
-            estado = str(row.get('ESTADO', '')).upper()
-            if row.get('HORA_LIQ') is not pd.NaT and pd.notnull(row.get('HORA_LIQ')): return False
-            if 'PENDIENTE' not in estado: return False
-            actividad = str(row.get('ACTIVIDAD', '')).upper()
-            comentario = str(row.get('COMENTARIO', '')).upper()
-            palabras_ignorar = ["INSTALACION", "INSFIBRA", "INSTALACIÓN"]
-            if any(p in actividad for p in palabras_ignorar) or any(p in comentario for p in palabras_ignorar):
-                return False
-            return row['ES_OFFLINE']
-
-        df['ES_OFFLINE'] = df.apply(validar_si_es_critico, axis=1)
-
-        # Tiempos
-        delta = df['HORA_LIQ'] - df['HORA_INI']
-        df['MINUTOS_CALC'] = delta.dt.total_seconds() / 60
-        df['TIEMPO_REAL'] = delta.apply(lambda x: f"{int(x.components.hours)}h {int(x.components.minutes)}m" if pd.notnull(x) else "---")
         df['DIAS_RETRASO'] = (hoy_dt.normalize() - df['FECHA_APE'].dt.normalize()).dt.days.fillna(0).clip(lower=0).astype(int)
         
-        if 'ACTIVIDAD' in df.columns:
-            df['SEGMENTO'] = df['ACTIVIDAD'].apply(lambda x: 'PLEX' if 'PLEX' in str(x).upper() else 'RESIDENCIAL')
+        # --- LÓGICA DE DETECCIÓN OFFLINE PRECISA ---
+        def detectar_offline_real(row):
+            actividad = str(row.get('ACTIVIDAD', '')).upper()
+            comentario = str(row.get('COMENTARIO', '')).upper()
+            palabras_ins = ['INS', 'NUEVA', 'ADIC', 'CAMBIO', 'RECU']
+            if any(p in actividad for p in palabras_ins): return False
+            return es_offline_preciso(comentario)
+
+        df['ES_OFFLINE'] = df.apply(detectar_offline_real, axis=1)
+        df['MINUTOS_CALC'] = (df['HORA_LIQ'] - df['HORA_INI']).dt.total_seconds() / 60
         
+        def asignar_segmento(row):
+            texto = f"{row.get('ACTIVIDAD', '')} {row.get('CLIENTE', '')} {row.get('COMENTARIO', '')}".upper()
+            return 'PLEX' if 'PLEX' in texto else 'RESIDENCIAL'
+        df['SEGMENTO'] = df.apply(asignar_segmento, axis=1)
+        
+        def format_duracion(row):
+            if pd.isnull(row['HORA_INI']) or pd.isnull(row['HORA_LIQ']): return "---"
+            d = row['HORA_LIQ'] - row['HORA_INI']
+            h, rem = divmod(d.total_seconds(), 3600)
+            m, _ = divmod(rem, 60)
+            return f"{int(h)}h {int(m)}m"
+        df['TIEMPO_REAL'] = df.apply(format_duracion, axis=1)
+
         return df
     except Exception as e:
-        st.error(f"❌ Error en carga: {e}")
-        return None
+        st.error(f"Error: {e}"); return None
 
 # --- ESTILOS ---
 def aplicar_estilos_df(df):
     df_display = df.copy()
     def row_styler(row):
         styles = [''] * len(row)
-        idx_num = row.index.get_loc('NUM') if 'NUM' in row.index else -1
-        if row.get('ES_OFFLINE', False) and idx_num != -1:
-            styles[idx_num] = 'background-color: #9b111e; color: white; font-weight: bold'
-        
-        if 'TIEMPO_REAL' in row.index and pd.notnull(row['MINUTOS_CALC']):
-            idx_t = row.index.get_loc('TIEMPO_REAL')
-            if row['MINUTOS_CALC'] >= 120: styles[idx_t] = 'background-color: #ef5350; color: white'
-            elif 0 < row['MINUTOS_CALC'] < 45: styles[idx_t] = 'background-color: #66bb6a; color: white'
-            
+        if row.get('ES_OFFLINE') == True:
+            if 'NUM' in row.index: styles[row.index.get_loc('NUM')] = 'background-color: #9b111e; color: white; font-weight: bold'
         if 'DIAS_RETRASO' in row.index:
-            idx_d = row.index.get_loc('DIAS_RETRASO')
-            d = row['DIAS_RETRASO']
-            if d >= 7: styles[idx_d] = 'background-color: #FF0000; color: white'
-            elif d >= 4: styles[idx_d] = 'background-color: #FFFF00; color: black'
-            elif d >= 1: styles[idx_d] = 'background-color: #CCFFCC; color: black'
-            else: styles[idx_d] = 'background-color: #00B050; color: white'
+            idx_d = row.index.get_loc('DIAS_RETRASO'); d = row['DIAS_RETRASO']
+            if d >= 7: styles[idx_d] = 'background-color: #d32f2f; color: white'
+            elif 4 <= d <= 6: styles[idx_d] = 'background-color: #ef6c00; color: white'
+            elif 1 <= d <= 3: styles[idx_d] = 'background-color: #fdd835; color: black'
+            elif d == 0: styles[idx_d] = 'background-color: #4caf50; color: white'
+        if pd.notnull(row.get('HORA_INI')) and pd.isnull(row.get('HORA_LIQ')):
+            if 'HORA_INI' in row.index: styles[row.index.get_loc('HORA_INI')] = 'background-color: #2196F3; color: white'
         return styles
 
     for col in ['HORA_INI', 'HORA_LIQ']:
         if col in df_display.columns: df_display[col] = df_display[col].dt.strftime('%H:%M').fillna("---")
+    
+    display_cols = ['DIAS_RETRASO', 'NUM', 'CLIENTE', 'ACTIVIDAD', 'SECTOR', 'TECNICO', 'MX', 'HORA_INI', 'HORA_LIQ', 'TIEMPO_REAL', 'ESTADO', 'COMENTARIO', 'ES_OFFLINE']
+    cols_p = [c for c in display_cols if c in df_display.columns]
+    return df_display[cols_p], row_styler
 
-    display_cols = ['DIAS_RETRASO', 'NUM', 'CLIENTE', 'ACTIVIDAD', 'SECTOR', 'COLONIA', 'TECNICO', 'MX', 'HORA_INI', 'HORA_LIQ', 'TIEMPO_REAL', 'ESTADO', 'COMENTARIO', 'ES_OFFLINE', 'MINUTOS_CALC']
-    cols_presentes = [c for c in display_cols if c in df_display.columns]
-    return df_display[cols_presentes], row_styler
-
-# --- INTERFAZ ---
+# --- MAIN ---
 def main():
-    with st.sidebar:
-        st.title("🧭 Menú Principal")
-        pagina = st.radio("Selecciona Vista:", ["⚡ Monitor en Vivo", "📚 Histórico No Instaladas"])
-        st.divider()
+    path = os.path.join(os.path.dirname(__file__), 'reporte.xlsx')
+    df_base = cargar_y_limpiar(path)
+    hoy_dt = datetime.now().date()
+    patron_act = 'PENDIENTE|INICIADA|PROCESO|ASIGNADA|DESPACHO'
+    
+    if df_base is None: return
 
-    if pagina == "📚 Histórico No Instaladas":
-        from historico import main_historico
-        main_historico()
+    with st.sidebar:
+        st.title("🧭 Panel PRO")
+        nav = st.radio("Navegación:", ["⚡ Monitor", "📚 Histórico Asignadas", "🚫 NOINSTALADO", "📦 Cierre Diario"])
+        
+        # --- FILTROS LATERALES ---
+        if nav == "⚡ Monitor":
+            st.divider()
+            st.header("🔍 Filtros")
+            mask_asignadas = df_base['ESTADO'].str.contains(patron_act, na=False, case=False)
+            total_off_asig = int((df_base['ES_OFFLINE'] & mask_asignadas).sum())
+            solo_off = st.toggle(f"Ver solo Offline Asignadas ({total_off_asig})")
+            tec_sel = st.selectbox("👤 Técnico:", ["Todos"] + sorted(df_base['TECNICO'].dropna().unique()))
+            sec_sel = st.selectbox("📍 Sector:", ["Todos"] + sorted(df_base['SECTOR'].dropna().unique()))
+            act_sel = st.multiselect("🛠️ Actividades:", sorted(df_base['ACTIVIDAD'].dropna().unique()))
+            
+            df_f = df_base.copy()
+            if solo_off: df_f = df_f[df_f['ES_OFFLINE'] & mask_asignadas]
+            if tec_sel != "Todos": df_f = df_f[df_f['TECNICO'] == tec_sel]
+            if sec_sel != "Todos": df_f = df_f[df_f['SECTOR'] == sec_sel]
+            if act_sel: df_f = df_f[df_f['ACTIVIDAD'].isin(act_sel)]
+        else:
+            df_f = df_base
+
+        # --- BOTÓN DE REPORTE GERENCIAL (RESTAURADO) ---
+        st.divider()
+        if st.button("📄 GENERAR REPORTE EFICIENCIA", use_container_width=True):
+            pdf_efi = logica_generar_pdf(df_base)
+            st.download_button("Descargar PDF", data=pdf_efi, file_name="Eficiencia_7D.pdf", mime="application/pdf", use_container_width=True)
+
+    # --- PÁGINAS ---
+    if nav == "📦 Cierre Diario":
+        st.title("📦 Cierre de Jornada")
+        fecha_sel = st.date_input("Fecha:", value=hoy_dt)
+        df_c = df_base[(df_base['HORA_LIQ'].dt.date == fecha_sel) & (df_base['ESTADO'].str.contains('CERRADA', na=False))]
+        if st.button("🚀 GENERAR PDF DE CIERRE"):
+            pdf = generar_pdf_cierre_diario(df_base, fecha_sel)
+            st.download_button("Descargar", data=pdf, file_name=f"Cierre_{fecha_sel}.pdf")
+        st.dataframe(df_c[['NUM', 'TECNICO', 'ACTIVIDAD', 'TIEMPO_REAL']], use_container_width=True)
         return
 
-    dir_app = os.path.dirname(os.path.abspath(__file__))
-    path_xlsx = os.path.join(dir_app, 'reporte.xlsx')
-    df_base = cargar_y_limpiar(path_xlsx)
+    if nav == "🚫 NOINSTALADO":
+        st.title("🚫 NOINSTALADO (Hoy)")
+        mask = (df_base['ACTIVIDAD'].str.upper().str.contains('NOINSTALADO', na=False)) & (df_base['HORA_LIQ'].dt.date == hoy_dt)
+        st.dataframe(df_base[mask][['NUM','CLIENTE','TECNICO','HORA_LIQ','COMENTARIO']], use_container_width=True)
+        return
 
-    if df_base is not None:
-        with st.sidebar:
-            st.header("🚨 Monitor Crítico")
-            total_off = int(df_base['ES_OFFLINE'].sum())
-            st.metric("OFFLINE ACTUAL", total_off)
-            solo_offline = st.toggle("Ver solo Críticos Offline")
-            st.header("🔍 Filtros Operativos")
-            tec_sel = st.selectbox("👤 Técnico:", ["-- Todos --"] + sorted(df_base['TECNICO'].dropna().unique()))
-            sec_sel = st.selectbox("📍 Sector:", ["-- Todos --"] + sorted(df_base['SECTOR'].dropna().unique())) if 'SECTOR' in df_base.columns else "-- Todos --"
-            act_sel = st.multiselect("🛠️ Actividades:", sorted(df_base['ACTIVIDAD'].dropna().unique()))
+    if nav == "📚 Histórico Asignadas":
+        from historico import main_historico; main_historico(); return
 
-        df_f = df_base.copy()
-        if solo_offline: df_f = df_f[df_f['ES_OFFLINE'] == True]
-        if tec_sel != "-- Todos --": df_f = df_f[df_f['TECNICO'] == tec_sel]
-        if sec_sel != "-- Todos --": df_f = df_f[df_f['SECTOR'] == sec_sel]
-        if act_sel: df_f = df_f[df_f['ACTIVIDAD'].isin(act_sel)]
+    # --- MONITOR KPIs ---
+    df_hoy = df_f[(df_f['HORA_LIQ'].dt.date == hoy_dt) | (df_f['HORA_LIQ'].isna())].copy()
+    df_kpi = df_hoy[df_hoy['ESTADO'].str.contains(patron_act, na=False, case=False)]
 
-        st.title("⚡ Monitor Operativo Maxcom")
+    st.title("⚡ Monitor Operativo Maxcom")
 
-        if 'status_view' not in st.session_state: st.session_state.status_view = "PENDIENTE"
-        status = st.session_state.status_view
-        hoy = datetime.now().date()
+    with st.expander("📊 CARGA DE TRABAJO ACTUAL (SOLO ASIGNADAS)", expanded=True):
+        c_dias, c_sop, c_ins, c_otros = st.columns([1, 1.2, 1.2, 1])
+        with c_dias:
+            st.caption("📅 Resumen de Retraso")
+            df_kpi['CatD'] = df_kpi['DIAS_RETRASO'].apply(lambda d: ">= 7 Dia" if d>=7 else (f"= {d} Dia"))
+            res_d = df_kpi['CatD'].value_counts().reindex([">= 7 Dia", "= 4 Dia", "= 1 Dia", "= 0 Dia"], fill_value=0).reset_index()
+            res_d.columns = ['Dias', 'Cant']
+            tot = res_d['Cant'].sum()
+            res_d['%'] = res_d['Cant'].apply(lambda x: f"{(x/tot*100):.0f}%" if tot > 0 else "0%")
+            st.dataframe(res_d, hide_index=True, use_container_width=True)
 
-        if status == "PENDIENTE":
-            df_active = df_f[df_f['ESTADO'].str.contains('PENDIENTE', na=False, case=False)]
-            label_metrica = "PENDIENTES"
-        elif status == "C_HOY":
-            df_active = df_f[(df_f['ESTADO'].str.contains('CERRADA', na=False, case=False)) & (df_f['HORA_LIQ'].dt.date == hoy)]
-            label_metrica = "CERRADAS"
-        else:
-            df_active = df_f[(df_f['ESTADO'].str.contains('ANULADA', na=False, case=False)) & (df_f['HORA_LIQ'].dt.date == hoy)]
-            label_metrica = "ANULADAS"
+        with c_sop:
+            st.caption("🛠️ SOP / Mantenimiento")
+            act_k = df_kpi['ACTIVIDAD'].str.upper()
+            com_k = df_kpi['COMENTARIO'].str.upper()
+            res_s = {
+                "RECONEXION": len(df_kpi[act_k.str.contains("RECONEX", na=False)]),
+                "FTTH / FIBRA": len(df_kpi[act_k.str.contains("FIBRA|FTTH", na=False)]),
+                "ONT/ONU Offline": int(df_kpi['ES_OFFLINE'].sum()),
+                "Niveles / Señal": len(df_kpi[com_k.str.contains("NIVEL|DB|SEÑAL", na=False)])
+            }
+            st.dataframe(pd.DataFrame(list(res_s.items()), columns=['SOP', 'Cant']), hide_index=True, use_container_width=True)
 
-        # Columnas Responsive para métricas
-        m1, m2, m3 = st.columns(3)
-        m1.metric(f"🏢 PLEX", len(df_active[df_active['SEGMENTO'] == 'PLEX']))
-        m2.metric(f"🏠 RESIDENCIAL", len(df_active[df_active['SEGMENTO'] == 'RESIDENCIAL']))
-        m3.metric(f"📋 TOTAL {label_metrica}", len(df_active))
-        st.divider()
+        with c_ins:
+            st.caption("📦 Instalaciones")
+            res_i = {
+                "Adicion": len(df_kpi[act_k.str.contains("ADIC", na=False)]),
+                "Cambio Medio": len(df_kpi[act_k.str.contains("CAMBIO", na=False)]),
+                "Nueva": len(df_kpi[act_k.str.contains("NUEVA|INS", na=False) & ~act_k.str.contains("SOP", na=False)]),
+                "Recuperado": len(df_kpi[act_k.str.contains("RECUP", na=False)])
+            }
+            st.dataframe(pd.DataFrame(list(res_i.items()), columns=['Instalaciones', 'Cant']), hide_index=True, use_container_width=True)
 
-        # Botones Responsive
-        c1, c2, c3 = st.columns(3)
-        if c1.button("⏳ PENDIENTES", use_container_width=True): 
-            st.session_state.status_view = "PENDIENTE"; st.rerun()
-        if c2.button("✅ CERRADAS HOY", use_container_width=True): 
-            st.session_state.status_view = "C_HOY"; st.rerun()
-        if c3.button("❌ ANULADAS HOY", use_container_width=True): 
-            st.session_state.status_view = "A_HOY"; st.rerun()
+        with c_otros:
+            st.caption("⚙️ Otros")
+            df_o = df_kpi[~act_k.str.contains("SOP|FALLA|MANT|INS|NUEVA|ADIC|CAMBIO|RECONEX", na=False)]
+            st.dataframe(df_o['ACTIVIDAD'].value_counts().reset_index().head(5), hide_index=True, use_container_width=True)
 
-        tab1, tab2 = st.tabs(["📋 PANEL DE CONTROL", "📈 RENDIMIENTO"])
-        
-        with tab1:
-            if not df_active.empty:
-                df_styled, styler = aplicar_estilos_df(df_active)
-                event = st.dataframe(
-                    df_styled.style.apply(styler, axis=1).hide(['ES_OFFLINE', 'MINUTOS_CALC', 'COMENTARIO'], axis="columns"),
-                    use_container_width=True, height=550, on_select="rerun", selection_mode="single-row"
-                )
-                if event.selection.rows:
-                    mostrar_comentario_cierre(df_active.iloc[event.selection.rows[0]])
-            else:
-                st.warning(f"No hay registros de {label_metrica}.")
+    with st.expander("📊 CONSOLIDADO PLEX / RESIDENCIAL", expanded=False):
+        res_p = df_kpi.groupby(['TECNICO', 'SEGMENTO']).size().reset_index(name='Cant')
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("🏢 PLEX ASIGNADOS"); st.dataframe(res_p[res_p['SEGMENTO']=='PLEX'][['TECNICO','Cant']], hide_index=True, use_container_width=True)
+        with col2:
+            st.write("🏠 RESIDENCIAL ASIGNADOS"); st.dataframe(res_p[res_p['SEGMENTO']=='RESIDENCIAL'][['TECNICO','Cant']], hide_index=True, use_container_width=True)
 
-        with tab2:
-            if not df_active.empty:
-                # Gráfica de barras
-                st.subheader("📊 Distribución de Carga")
-                res_act = df_active.groupby(['TECNICO', 'ACTIVIDAD']).size().reset_index(name='Cant')
-                fig_bar = px.bar(res_act, x='TECNICO', y='Cant', color='ACTIVIDAD', barmode='stack')
-                st.plotly_chart(fig_bar, use_container_width=True)
-                
-                # Gantt Responsive
-                st.subheader("⏱️ Tiempos en Campo (Gantt)")
-                df_g = df_active.dropna(subset=['HORA_INI', 'HORA_LIQ']).copy()
-                if not df_g.empty:
-                    fig_g = px.timeline(df_g, x_start="HORA_INI", x_end="HORA_LIQ", y="TECNICO", color="ACTIVIDAD", text="ACTIVIDAD")
-                    fig_g.update_yaxes(autorange="reversed")
-                    fig_g.update_traces(textposition='inside', textfont_size=10)
-                    st.plotly_chart(fig_g, use_container_width=True)
+    st.divider()
+    if 'status_v' not in st.session_state: st.session_state.status_v = "PENDIENTE"
+    b1, b2, b3 = st.columns(3)
+    if b1.button("⏳ ACTIVAS", use_container_width=True): st.session_state.status_v = "PENDIENTE"; st.rerun()
+    if b2.button("✅ CERRADAS HOY", use_container_width=True): st.session_state.status_v = "C_HOY"; st.rerun()
+    if b3.button("❌ ANULADAS HOY", use_container_width=True): st.session_state.status_v = "A_HOY"; st.rerun()
 
-if __name__ == "__main__":
-    main()
+    status = st.session_state.status_v
+    df_v_hoy = df_f[(df_f['HORA_LIQ'].dt.date == hoy_dt) | (df_f['HORA_LIQ'].isna())].copy()
+
+    if status == "PENDIENTE": df_view = df_kpi
+    elif status == "C_HOY": df_view = df_v_hoy[(df_v_hoy['ESTADO'].str.contains('CERRADA', na=False)) & (df_v_hoy['HORA_LIQ'].dt.date == hoy_dt)]
+    else: df_view = df_v_hoy[(df_v_hoy['ESTADO'].str.contains('ANULADA', na=False)) & (df_v_hoy['HORA_LIQ'].dt.date == hoy_dt)]
+
+    t1, t2 = st.tabs(["📋 PANEL", "📊 GANTT"])
+    with t1:
+        if not df_view.empty:
+            df_s, styler = aplicar_estilos_df(df_view)
+            event = st.dataframe(df_s.style.apply(styler, axis=1).hide(axis=1, subset=['ES_OFFLINE']), use_container_width=True, height=500, hide_index=True, on_select="rerun", selection_mode="single-row")
+            if event.selection.rows: mostrar_comentario_cierre(df_view.iloc[event.selection.rows[0]])
+    with t2:
+        df_g = df_view[df_view['HORA_INI'].notnull()].copy()
+        if not df_g.empty:
+            df_g['FIN'] = df_g['HORA_LIQ'].fillna(datetime.now())
+            fig = px.timeline(df_g, x_start="HORA_INI", x_end="FIN", y="TECNICO", color="ACTIVIDAD", template="plotly_dark", height=600)
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig, use_container_width=True)
+
+if __name__ == "__main__": main()
